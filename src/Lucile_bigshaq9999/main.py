@@ -344,9 +344,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter.addWidget(self.canvas_view)
         self.splitter.addWidget(self.editor)
 
-        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([200, 750, 300])
 
         self.status_bar = QtWidgets.QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -521,8 +522,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
 
 
-if __name__ == "__main__":
+def main():
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
