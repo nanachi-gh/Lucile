@@ -79,6 +79,42 @@ class ModelManager(QtCore.QObject):
         except Exception as e:
             self.status_update.emit(f"Load error: {e}")
 
+    @QtCore.Slot(str)
+    def switch_segmentation_model(self, model_name):
+        self.is_ready = False
+        self.status_update.emit(f"Switching segmentation to {model_name}...")
+        try:
+            path = hf_hub_download(
+                repo_id=f"TheBlindMaster/{model_name}-manga-bubble-seg",
+                filename="best.pt",
+            )
+            if self.seg_model:
+                del self.seg_model
+
+            self.seg_model = BubbleSegmenter(path)
+            self.status_update.emit(f"Segmentation: {model_name} ready.")
+        except Exception as e:
+            self.status_update.emit(f"Error loading {model_name}: {e}")
+        finally:
+            self.is_ready = True
+
+    @QtCore.Slot(str)
+    def switch_translation_model(self, model_name):
+        self.is_ready = False
+        self.status_update.emit(f"Switching translation to {model_name}...")
+        try:
+            if self.trans_model:
+                self.trans_model.unload_model()
+                del self.trans_model
+
+            self.trans_model = ElanMtJaEnTranslator()
+            self.trans_model.load_model(elan_model=model_name)
+            self.status_update.emit(f"Translation: {model_name} ready")
+        except Exception as e:
+            self.status_update.emit(f"Error loading {model_name}: {e}")
+        finally:
+            self.is_ready = True
+
 
 class BatchProcessor(QtCore.QObject):
     """
@@ -271,6 +307,8 @@ class EditorPanel(QtWidgets.QWidget):
 
 class MainWindow(QtWidgets.QMainWindow):
     process_signal = QtCore.Signal(ImageProject)
+    request_segmenter_switch = QtCore.Signal(str)
+    request_translator_switch = QtCore.Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -314,7 +352,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.process_signal.connect(self.processor.add_to_queue)
 
+        self.request_segmenter_switch.connect(
+            self.model_manager.switch_segmentation_model
+        )
+        self.request_translator_switch.connect(
+            self.model_manager.switch_translation_model
+        )
+
         self.setup_ui()
+        self.setup_menu()
 
     def setup_ui(self):
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -354,6 +400,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel("Initializing...")
         self.status_bar.addWidget(self.status_label)
         self.scene.selectionChanged.connect(self.on_selection_changed)
+
+    def setup_menu(self):
+        menu_bar = self.menuBar()
+
+        ai_menu = menu_bar.addMenu("AI models")
+
+        segmentation_menu = ai_menu.addMenu("Segmentation Model")
+        segmentation_group = QtGui.QActionGroup(self)
+
+        segmentation_models = ["yolov8n", "yolov8s", "yolov11n", "yolov11s"]
+        for name in segmentation_models:
+            action = QtGui.QAction(name, self)
+            action.setCheckable(True)
+            if name == "yolov8s":
+                action.setChecked(True)
+
+            action.triggered.connect(
+                lambda checked, n=name: self.request_segmenter_switch.emit(n)
+            )
+
+            segmentation_menu.addAction(action)
+            segmentation_group.addAction(action)
+
+        translation_menu = ai_menu.addMenu("Translation Model")
+        translation_group = QtGui.QActionGroup(self)
+
+        translation_models = ["tiny", "base", "bt"]
+        for name in translation_models:
+            action = QtGui.QAction(name, self)
+            action.setCheckable(True)
+            if name == "base":
+                action.setChecked(True)
+
+            action.triggered.connect(
+                lambda checked, n=name: self.request_translator_switch.emit(n)
+            )
+
+            translation_menu.addAction(action)
+            translation_group.addAction(action)
 
     def closeEvent(self, event):
         if self.model_thread.isRunning():
