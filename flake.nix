@@ -6,8 +6,6 @@
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ inputs.devenv.flakeModule ];
       systems = [
-        "x86_64-linux"
-        "aarch64-linux"
         "aarch64-darwin"
       ];
 
@@ -82,7 +80,7 @@
                 hooks.nixfmt-rfc-style = {
                   enable = true;
                   inherit excludes;
-                  package = pkgs.nixfmt-rfc-style;
+                  package = pkgs.nixfmt;
                 };
                 hooks.shellcheck.enable = true;
               };
