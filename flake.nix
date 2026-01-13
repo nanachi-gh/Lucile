@@ -80,7 +80,7 @@
                 hooks.nixfmt-rfc-style = {
                   enable = true;
                   inherit excludes;
-                  package = pkgs.nixfmt-rfc-style;
+                  package = pkgs.nixfmt;
                 };
                 hooks.shellcheck.enable = true;
               };

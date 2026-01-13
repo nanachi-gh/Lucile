@@ -1,472 +1,528 @@
-import sys
 import os
-import numpy as np
+import sys
+
 import cv2
+import numpy as np
+from huggingface_hub import hf_hub_download
 from PIL import Image
-from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from Lucile_bigshaq9999.MangaTypesetter import MangaTypesetter
 from Lucile_bigshaq9999.BubbleSegmenter import BubbleSegmenter
+from Lucile_bigshaq9999.ElanMtJaEnTranslator import ElanMtJaEnTranslator
+from Lucile_bigshaq9999.MangaOCRModel import MangaOCRModel
+from Lucile_bigshaq9999.MangaTypesetter import MangaTypesetter
 
 
-# --- WORKERS ---
-class BackgroundLoader(QtCore.QObject):
-    """
-    Loads OCR and Translator sequentially in the background.
-    """
+class BubbleData:
+    def __init__(self, polygon, bbox, raw_mask, ocr_text="", trans_text=""):
+        self.polygon = polygon
+        self.bbox = bbox
+        self.raw_mask = raw_mask
+        self.ocr_text = ocr_text
+        self.trans_text = trans_text
 
-    finished = QtCore.Signal(object, object)  # Emits (ocr_model, translator_model)
-    progress = QtCore.Signal(str)
 
-    def run(self):
-        ocr_model = None
-        translator_model = None
+class ImageProject:
+    """Represents one file in the batch queue"""
 
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.status = "queued"
+        self.bubbles = []
+        self.thumbnail = None
+
+
+# --- Workers --- #
+class ModelManager(QtCore.QObject):
+    """Holds the loaded models and handles loading them in background"""
+
+    models_ready = QtCore.Signal()
+    status_update = QtCore.Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.seg_model = None
+        self.ocr_model = None
+        self.trans_model = None
+        self.is_ready = False
+
+    def load_all(self):
+        """Run in a thread"""
         try:
-            self.progress.emit("Pre-loading OCR Model...")
-            from Lucile_bigshaq9999.MangaOCRModel import MangaOCRModel
+            # Segmentation (default: yolov8a)
+            self.status_update.emit("Loading YOLO...")
+            model_name = "yolov8s"
+            path = hf_hub_download(
+                repo_id=f"TheBlindMaster/{model_name}-manga-bubble-seg",
+                filename="best.pt",
+            )
+            self.seg_model = BubbleSegmenter(path)
 
-            ocr_model = MangaOCRModel()
-            ocr_model.load_model()
+            # OCR
+            self.status_update.emit("Loading OCR...")
+            self.ocr_model = MangaOCRModel()
+            self.ocr_model.load_model()
 
-            # Warming up with dummy input
-            dummy = Image.new("RGB", (50, 50), "white")
-            ocr_model.predict(dummy, [[0, 0, 50, 50]])
+            # Warm-up dummy
+            self.ocr_model.predict(Image.new("RGB", (50, 50)), [[0, 0, 50, 50]])
 
-            self.progress.emit("Pre-loading Translator...")
-            from Lucile_bigshaq9999.ElanMtJaEnTranslator import ElanMtJaEnTranslator
+            # Translate
+            self.status_update.emit("Loading translator...")
+            self.trans_model = ElanMtJaEnTranslator()
+            self.trans_model.load_model(device="auto", elan_model="base")
 
-            translator_model = ElanMtJaEnTranslator()
-            # Default to base for balance, or make configurable
-            translator_model.load_model(device="auto", elan_model="bt")
-            # TODO make this changeable
-
-            self.progress.emit("Background models ready.")
-            self.finished.emit(ocr_model, translator_model)
+            self.is_ready = True
+            self.status_update.emit("Ready")
+            self.models_ready.emit()
 
         except Exception as e:
-            print(f"Background load failed: {e}")
-            # Even if failed, emit what we have (None) so app doesn't hang
-            self.finished.emit(ocr_model, translator_model)
+            self.status_update.emit(f"Load error: {e}")
+
+
+class BatchProcessor(QtCore.QObject):
+    """
+    Watches the queue and processes images using the ModelManager models
+    """
+
+    image_processed = QtCore.Signal(str)
+    progress = QtCore.Signal(str, str)
+
+    def __init__(self, model_manager):
+        super().__init__()
+        self.models = model_manager
+        self.queue = []
+        self.is_running = False
+
+    def add_to_queue(self, project: ImageProject):
+        self.queue.append(project)
+        self.process_next()
+
+    def process_next(self):
+        if self.is_running or not self.queue:
+            return
+
+        if not self.models.is_ready:
+            return
+
+        self.is_running = True
+        project = self.queue.pop(0)
+        project.status = "processing"
+        self.progress.emit(project.path, "Processing...")
+
+        self._run_inference(project)
+
+    def _run_inference(self, project):
+        try:
+            img_rgb, _, refined = self.models.seg_model.detect_and_segment(project.path)
+
+            if not refined:
+                project.status = "ready (no bubbles)"
+            else:
+                pil_img = Image.fromarray(img_rgb)
+                bboxes = [b["bbox"] for b in refined]
+                xyxy = [[b[0], b[1], b[0] + b[2], b[1] + b[3]] for b in bboxes]
+
+                texts = self.models.ocr_model.predict(pil_img, xyxy)
+
+                # Translate
+                trans = self.models.trans_model.predict(texts)
+
+                # Store
+                project.bubbles = []
+                for i, r in enumerate(refined):
+                    poly = QtGui.QPolygonF()
+                    for pt in r["contour"]:
+                        poly.append(QtCore.QPointF(pt[0][0], pt[0][1]))
+
+                    bubble = BubbleData(
+                        polygon=poly,
+                        bbox=xyxy[i],
+                        raw_mask=r["original_mask"],
+                        ocr_text=texts[i],
+                        trans_text=trans[i],
+                    )
+                    project.bubbles.append(bubble)
+
+                project.status = "ready"
+
+            self.image_processed.emit(project.path)
+
+        except Exception as e:
+            print(f"Error processing {project.name}: {e}")
+            project.status = "error"
+            self.progress.emit(project.path, "Error")
+            self.image_processed.emit(project.path)
+
+        self.is_running = False
+        self.process_next()
+
+
+# --- UI Widgets --- #
+class FileQueueList(QtWidgets.QListWidget):
+    """Handles drag & drop of files"""
+
+    files_dropped = QtCore.Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DropOnly)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.setDropAction(QtCore.Qt.CopyAction)
+            event.accept()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        paths = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                paths.append(path)
+
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
 
 
 class ZoomableGraphicsView(QtWidgets.QGraphicsView):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        # High quality rendering
+    """View with zoom and pan"""
+
+    def __init__(self):
+        super().__init__()
         self.setRenderHint(QtGui.QPainter.Antialiasing)
         self.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-
-        # Allow panning with left mouse click & drag
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
-
-        # Show scrollbars only when zoomed in (needed for standard scrolling)
-        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-
-        # Zooming will center on the mouse cursor
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setBackgroundBrush(QtGui.QBrush(QtGui.QColor(50, 50, 50)))
 
     def wheelEvent(self, event):
-        """
-        Ctrl + Scroll to Zoom
-        Standard Scroll to Pan vertically
-        """
-        # Check if the Control key is currently pressed
         if event.modifiers() & QtCore.Qt.ControlModifier:
-            # --- ZOOM LOGIC ---
-            zoom_in_factor = 1.15
-            zoom_out_factor = 1 / zoom_in_factor
-
-            # angleDelta().y() > 0 means scrolling UP (Zoom In)
+            zoom_in = 1.15
             if event.angleDelta().y() > 0:
-                self.scale(zoom_in_factor, zoom_in_factor)
+                self.scale(zoom_in, zoom_in)
             else:
-                self.scale(zoom_out_factor, zoom_out_factor)
-
-            # Important: Accept the event so it doesn't propagate to the parent
-            # or trigger the default scroll behavior simultaneously.
+                self.scale(1 / zoom_in, 1 / zoom_in)
             event.accept()
-
         else:
-            # --- STANDARD SCROLL LOGIC ---
-            # Pass the event to the parent class to handle normal scrolling
             super().wheelEvent(event)
 
 
-class ProcessingPipeline(QtCore.QObject):
-    """
-    Runs the actual image processing:
-    Seg -> OCR -> Translate -> Typeset
-    """
+# --- panes --- #
+class EditorPanel(QtWidgets.QWidget):
+    """Right pane: OCR and Translation editing"""
 
-    status_update = QtCore.Signal(int, str)  # progress %, message
-    finished = QtCore.Signal(object)  # Final PIL Image
-    error = QtCore.Signal(str)
-
-    def __init__(self, image_path, yolo_model_name, ocr_model, translator_model):
-        super().__init__()
-        self.image_path = image_path
-        self.yolo_model_name = yolo_model_name
-        self.ocr_model = ocr_model
-        self.translator_model = translator_model
-
-    def _polygon_to_mask(self, polygon, width, height):
-        # Helper specific to typesetting preparation
-        mask = np.zeros((height, width), dtype=np.uint8)
-        points = []
-        for point in polygon:
-            points.append([int(point.x()), int(point.y())])
-
-        if not points:
-            return mask
-        pts = np.array([points], dtype=np.int32)
-        cv2.fillPoly(mask, pts, 255)
-        return mask
-
-    def run(self):
-        try:
-            # --- STEP 1: SEGMENTATION ---
-            self.status_update.emit(10, "Downloading/Loading YOLO...")
-
-            # Lazy import huggingface
-            from huggingface_hub import hf_hub_download
-
-            # Download/Locate Model
-            file_path = hf_hub_download(
-                repo_id=f"TheBlindMaster/{self.yolo_model_name}-manga-bubble-seg",
-                filename="best.pt",
-            )
-
-            self.status_update.emit(20, "Running Segmentation...")
-            segmenter = BubbleSegmenter(file_path)
-
-            # Run Inference
-            image_rgb, _, refined_bubbles = segmenter.detect_and_segment(
-                self.image_path
-            )
-
-            if not refined_bubbles:
-                raise ValueError("No bubbles found in image.")
-
-            # --- STEP 2: PREPARE DATA ---
-            self.status_update.emit(40, "Preparing regions...")
-            pil_image = Image.fromarray(image_rgb)
-            bboxes = []
-            valid_bubbles_data = []  # Store logic data needed for next steps
-
-            for b in refined_bubbles:
-                x, y, w, h = b["bbox"]
-                bboxes.append([x, y, x + w, y + h])
-
-                # Convert contour to QPolygonF-like list for typesetter helper
-                poly_points = [
-                    QtCore.QPointF(pt[0][0], pt[0][1]) for pt in b["contour"]
-                ]
-
-                valid_bubbles_data.append({
-                    "polygon": poly_points,
-                    "original_mask": b["original_mask"],
-                })
-
-            # --- STEP 3: OCR ---
-            self.status_update.emit(50, "Running OCR...")
-            if not self.ocr_model:
-                raise RuntimeError("OCR Model not loaded yet.")
-
-            ocr_texts = self.ocr_model.predict(pil_image, bboxes)
-
-            # --- STEP 4: TRANSLATION ---
-            self.status_update.emit(70, "Translating Text...")
-            if not self.translator_model:
-                raise RuntimeError("Translator Model not loaded yet.")
-
-            translated_texts = self.translator_model.predict(ocr_texts)
-
-            # --- STEP 5: TYPESETTING ---
-            self.status_update.emit(90, "Typesetting Final Image...")
-
-            height, width, _ = image_rgb.shape
-            typesetter_data = []
-
-            for i, data in enumerate(valid_bubbles_data):
-                # Rasterize polygon for typesetting
-                mask = self._polygon_to_mask(data["polygon"], width, height)
-
-                typesetter_data.append({
-                    "translated_text": translated_texts[i],
-                    "mask": mask,
-                    "original_mask": data["original_mask"],
-                })
-
-            ts = MangaTypesetter()
-            final_np = ts.render(image_rgb, typesetter_data)
-            final_pil = Image.fromarray(final_np)
-
-            self.status_update.emit(100, "Done!")
-            self.finished.emit(final_pil)
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# --- PAGES (UI) ---
-
-
-class SetupPage(QtWidgets.QWidget):
-    start_processing = QtCore.Signal(str, str)  # image_path, model_name
+    text_changed = QtCore.Signal(str)
+    save_requested = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(20)
-        layout.setAlignment(QtCore.Qt.AlignCenter)
 
-        # Title
-        title = QtWidgets.QLabel("Lucile")
-        title.setFont(QtGui.QFont("Arial", 20, QtGui.QFont.Bold))
-        title.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(title)
+        layout.addWidget(QtWidgets.QLabel("<b>Original text (OCR)</b>"))
+        self.ocr_edit = QtWidgets.QTextEdit()
+        self.ocr_edit.setMaximumHeight(100)
+        layout.addWidget(self.ocr_edit)
 
-        # Model Selector
-        form_layout = QtWidgets.QFormLayout()
-        self.modelCombo = QtWidgets.QComboBox()
-        self.modelCombo.addItems(["yolov8s", "yolov8n", "yolov11s", "yolov11n"])
-        form_layout.addRow("Segmentation Model:", self.modelCombo)
-        layout.addLayout(form_layout)
+        layout.addSpacing(10)
 
-        # Image Selection
-        self.imgBtn = QtWidgets.QPushButton("Select Image")
-        self.imgBtn.clicked.connect(self.select_image)
-        layout.addWidget(self.imgBtn)
+        layout.addWidget(QtWidgets.QLabel("<b>Translation</b>"))
+        self.trans_edit = QtWidgets.QTextEdit()
+        self.trans_edit.textChanged.connect(self.on_text_changed)
+        layout.addWidget(self.trans_edit)
 
-        self.imgLabel = QtWidgets.QLabel("No image selected")
-        self.imgLabel.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.imgLabel)
+        layout.addStretch()
 
-        # Start Button
-        self.nextBtn = QtWidgets.QPushButton("Start Processing")
-        self.nextBtn.clicked.connect(self.on_next)
-        self.nextBtn.setEnabled(False)
-        layout.addWidget(self.nextBtn)
+        self.save_button = QtWidgets.QPushButton("Save / export image")
+        self.save_button.clicked.connect(self.save_requested.emit)
+        layout.addWidget(self.save_button)
 
-        # Status of background loading
-        self.statusLabel = QtWidgets.QLabel("Initializing AI models...")
-        self.statusLabel.setStyleSheet("color: gray; font-style: italic;")
-        self.statusLabel.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.statusLabel)
+        self.current_bubble = None
+        self.is_internal_update = False
 
-        self.selected_image_path = None
+    def load_bubble(self, bubble: BubbleData):
+        self.is_internal_update = True
+        self.current_bubble = bubble
+        self.ocr_edit.setText(bubble.ocr_text)
+        self.trans_edit.setText(bubble.trans_text)
+        self.is_internal_update = False
 
-    def select_image(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Image", "", "Images (*.png *.jpg *.jpeg)"
-        )
-        if path:
-            self.selected_image_path = path
-            self.imgLabel.setText(os.path.basename(path))
-            self.nextBtn.setEnabled(True)
+    def on_text_changed(self):
+        if self.current_bubble and not self.is_internal_update:
+            new_text = self.trans_edit.toPlainText()
+            self.current_bubble.trans_text = new_text
+            self.text_changed.emit(new_text)
 
-    def on_next(self):
-        if self.selected_image_path:
-            self.start_processing.emit(
-                self.selected_image_path, self.modelCombo.currentText()
-            )
-
-    def update_bg_status(self, msg):
-        self.statusLabel.setText(msg)
+    def clear_fields(self):
+        self.is_internal_update = True
+        self.ocr_edit.clear()
+        self.trans_edit.clear()
+        self.current_bubble = None
+        self.is_internal_update = False
 
 
-class ProgressPage(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setAlignment(QtCore.Qt.AlignCenter)
+class MainWindow(QtWidgets.QMainWindow):
+    process_signal = QtCore.Signal(ImageProject)
 
-        self.infoLabel = QtWidgets.QLabel("Processing...")
-        self.infoLabel.setFont(QtGui.QFont("Arial", 14))
-        layout.addWidget(self.infoLabel)
-
-        self.progressBar = QtWidgets.QProgressBar()
-        self.progressBar.setRange(0, 100)
-        self.progressBar.setValue(0)
-        self.progressBar.setFixedWidth(400)
-        layout.addWidget(self.progressBar)
-
-        self.logLabel = QtWidgets.QLabel("Starting pipeline...")
-        layout.addWidget(self.logLabel)
-
-    def update_progress(self, val, msg):
-        self.progressBar.setValue(val)
-        self.logLabel.setText(msg)
-
-
-class ResultPage(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # --- CHANGED LINE BELOW ---
-        # Use the custom class instead of the standard QGraphicsView
-        self.view = ZoomableGraphicsView()
-
-        self.scene = QtWidgets.QGraphicsScene()
-        self.view.setScene(self.scene)
-
-        layout.addWidget(self.view)
-
-        # Bottom buttons
-        btnLayout = QtWidgets.QHBoxLayout()
-        self.saveBtn = QtWidgets.QPushButton("Save Image")
-        self.saveBtn.clicked.connect(self.save_image)
-        self.backBtn = QtWidgets.QPushButton("Process Another")
-
-        btnLayout.addWidget(self.backBtn)
-        btnLayout.addWidget(self.saveBtn)
-        layout.addLayout(btnLayout)
-
-        self.final_pil = None
-
-    def display_image(self, pil_img):
-        self.final_pil = pil_img
-        self.scene.clear()
-
-        # Convert PIL to QPixmap
-        data = pil_img.convert("RGBA").tobytes("raw", "RGBA")
-        qim = QtGui.QImage(
-            data, pil_img.width, pil_img.height, QtGui.QImage.Format_RGBA8888
-        )
-        pixmap = QtGui.QPixmap.fromImage(qim)
-
-        self.scene.addPixmap(pixmap)
-        self.scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
-        self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
-
-    def save_image(self):
-        if not self.final_pil:
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save", "output.png", "Images (*.png *.jpg)"
-        )
-        if path:
-            self.final_pil.save(path)
-            QtWidgets.QMessageBox.information(
-                self, "Saved", "Image saved successfully."
-            )
-
-
-# --- MAIN CONTROLLER ---
-
-
-class MainWizard(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lucile")
-        self.resize(500, 400)  # Small start window
+        self.resize(1200, 800)
 
-        # State
-        self.ocr_model = None
-        self.translator_model = None
-        self.are_models_ready = False
-        self.pending_pipeline_request = (
-            None  # If user clicks next before models are ready
+        self.projects = {}
+        self.current_project = None
+        self.active_visuals = {}
+
+        # Loading Dialog
+        self.loading_modal = QtWidgets.QProgressDialog()
+        self.loading_modal.setLabelText("Loading AI models...")
+        self.loading_modal.setCancelButton(None)
+        self.loading_modal.setRange(0, 0)
+        self.loading_modal.setWindowModality(QtCore.Qt.ApplicationModal)
+        self.loading_modal.setWindowFlags(
+            QtCore.Qt.Dialog | QtCore.Qt.CustomizeWindowHint | QtCore.Qt.WindowTitleHint
         )
+        self.loading_modal.show()
 
-        # Stack Setup
-        self.stack = QtWidgets.QStackedWidget()
-        self.setCentralWidget(self.stack)
+        # Model manager
+        self.model_thread = QtCore.QThread()
+        self.model_manager = ModelManager()
+        self.model_manager.moveToThread(self.model_thread)
+        self.model_thread.started.connect(self.model_manager.load_all)
+        self.model_manager.models_ready.connect(self.loading_modal.accept)
+        self.model_thread.start()
 
-        self.setupPage = SetupPage()
-        self.progressPage = ProgressPage()
-        self.resultPage = ResultPage()
+        self.proc_thread = QtCore.QThread()
+        self.processor = BatchProcessor(self.model_manager)
+        self.processor.moveToThread(self.proc_thread)
+        self.proc_thread.start()
 
-        self.stack.addWidget(self.setupPage)
-        self.stack.addWidget(self.progressPage)
-        self.stack.addWidget(self.resultPage)
+        # Signal
+        self.model_manager.status_update.connect(self.update_global_status)
+        self.model_manager.models_ready.connect(self.on_models_ready)
 
-        # Signals
-        self.setupPage.start_processing.connect(self.initiate_processing)
-        self.resultPage.backBtn.clicked.connect(self.reset_ui)
+        self.processor.image_processed.connect(self.on_image_processed)
+        self.processor.progress.connect(self.update_file_status)
 
-        # Start Background Loading Immediately
-        self.start_background_loading()
+        self.process_signal.connect(self.processor.add_to_queue)
 
-    def start_background_loading(self):
-        self.bg_thread = QtCore.QThread()
-        self.bg_worker = BackgroundLoader()
-        self.bg_worker.moveToThread(self.bg_thread)
+        self.setup_ui()
 
-        self.bg_thread.started.connect(self.bg_worker.run)
-        self.bg_worker.progress.connect(self.setupPage.update_bg_status)
-        self.bg_worker.finished.connect(self.on_models_loaded)
+    def setup_ui(self):
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.setCentralWidget(self.splitter)
 
-        # Cleanup
-        self.bg_worker.finished.connect(self.bg_thread.quit)
-        self.bg_worker.finished.connect(self.bg_worker.deleteLater)
-        self.bg_thread.finished.connect(self.bg_thread.deleteLater)
+        # left pane
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.bg_thread.start()
+        self.file_list = FileQueueList()
+        self.file_list.files_dropped.connect(self.add_files)
+        self.file_list.itemClicked.connect(self.load_project_into_view)
 
-    def on_models_loaded(self, ocr, trans):
-        self.ocr_model = ocr
-        self.translator_model = trans
-        self.are_models_ready = True
+        left_layout.addWidget(QtWidgets.QLabel("<b>File queue</b>"))
+        left_layout.addWidget(self.file_list)
 
-        # If user already clicked next, execute now
-        if self.pending_pipeline_request:
-            self.run_pipeline(*self.pending_pipeline_request)
-        else:
-            self.setupPage.update_bg_status("Models Ready. Select image to begin.")
+        self.canvas_view = ZoomableGraphicsView()
+        self.scene = QtWidgets.QGraphicsScene()
+        self.canvas_view.setScene(self.scene)
 
-    def initiate_processing(self, img_path, model_name):
-        # Switch to progress immediately
-        self.stack.setCurrentWidget(self.progressPage)
+        self.editor = EditorPanel()
+        self.editor.text_changed.connect(self.update_bubble_preview)
+        self.editor.save_requested.connect(self.save_current)
 
-        if self.are_models_ready:
-            self.run_pipeline(img_path, model_name)
-        else:
-            self.progressPage.update_progress(
-                0, "Waiting for AI models to finish loading..."
+        self.splitter.addWidget(left_widget)
+        self.splitter.addWidget(self.canvas_view)
+        self.splitter.addWidget(self.editor)
+
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 1)
+
+        self.status_bar = QtWidgets.QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_label = QtWidgets.QLabel("Initializing...")
+        self.status_bar.addWidget(self.status_label)
+        self.scene.selectionChanged.connect(self.on_selection_changed)
+
+    def closeEvent(self, event):
+        if self.model_thread.isRunning():
+            self.model_thread.quit()
+            self.model_thread.wait()
+
+        if self.proc_thread.isRunning():
+            self.proc_thread.quit()
+            self.proc_thread.wait()
+
+    # --- logic --- #
+    def update_global_status(self, msg):
+        self.status_label.setText(msg)
+
+    def on_models_ready(self):
+        self.status_label.setText("Models ready.")
+        self.processor.process_next()
+
+    def add_files(self, paths):
+        for path in paths:
+            if path in self.projects:
+                continue
+
+            proj = ImageProject(path)
+            self.projects[path] = proj
+            self.process_signal.emit(proj)
+
+            item = QtWidgets.QListWidgetItem(proj.name)
+            item.setData(QtCore.Qt.UserRole, path)
+            item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+            self.file_list.addItem(item)
+
+            item.setText(f"{proj.name} (Queued)")
+
+    def update_file_status(self, path, status_msg):
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item.data(QtCore.Qt.UserRole) == path:
+                item.setText(f"{os.path.basename(path)} ({status_msg})")
+                if status_msg == "Error":
+                    item.setForeground(QtGui.QBrush(QtCore.Qt.red))
+                break
+
+    def on_image_processed(self, path):
+        self.projects[path].status = "ready"
+        self.update_file_status(path, "Ready")
+
+        # if currently viewing this project, refresh view
+        if self.current_project and self.current_project.path == path:
+            self.load_project_into_view(self.file_list.currentItem())
+
+    def load_project_into_view(self, item):
+        path = item.data(QtCore.Qt.UserRole)
+        project = self.projects[path]
+        self.current_project = project
+        self.scene.clear()
+        self.active_visuals.clear()
+        self.editor.clear_fields()
+
+        if not os.path.exists(path):
+            return
+        pix = QtGui.QPixmap(path)
+        self.scene.addPixmap(pix)
+        self.scene.setSceneRect(QtCore.QRectF(pix.rect()))
+        self.canvas_view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+
+        if project.status == "ready":
+            for bubble in project.bubbles:
+                box_item = QtWidgets.QGraphicsPolygonItem(bubble.polygon)
+                box_item.setPen(QtGui.QPen(QtCore.Qt.green, 3))
+                box_item.setBrush(QtGui.QBrush(QtGui.QColor(0, 255, 0, 20)))
+                box_item.setFlags(QtWidgets.QGraphicsItem.ItemIsSelectable)
+
+                box_item.setData(0, bubble)
+                self.scene.addItem(box_item)
+
+                bubble.graphics_item = box_item
+
+                visuals = self.create_text_preview(bubble)
+                self.active_visuals[bubble] = visuals
+
+    def create_text_preview(self, bubble: BubbleData):
+        text_content = bubble.trans_text if bubble.trans_text else ""
+        t_item = QtWidgets.QGraphicsTextItem(text_content)
+        t_item.setDefaultTextColor(QtCore.Qt.black)
+
+        font = QtGui.QFont("Comic Sans MS", 12, QtGui.QFont.Bold)
+        t_item.setFont(font)
+
+        x1, y1, x2, y2 = bubble.bbox
+        t_item.setPos(x1, y1)
+
+        bg = QtWidgets.QGraphicsRectItem(t_item.boundingRect())
+        bg.setBrush(QtCore.Qt.white)
+        bg.setPen(QtCore.Qt.NoPen)
+        bg.setPos(x1, y1)
+        bg.setZValue(5)
+        t_item.setZValue(6)
+
+        self.scene.addItem(bg)
+        self.scene.addItem(t_item)
+
+        return (bg, t_item)
+
+    def on_selection_changed(self):
+        items = self.scene.selectedItems()
+        if items:
+            bubble = items[0].data(0)
+            self.editor.load_bubble(bubble)
+
+    @QtCore.Slot()
+    def update_bubble_preview(self, new_text):
+        bubble = self.editor.current_bubble
+
+        if bubble in self.active_visuals:
+            bg_item: QtWidgets.QGraphicsRectItem
+            text_item: QtWidgets.QGraphicsTextItem
+            bg_item, text_item = self.active_visuals[bubble]
+            text_item.setPlainText(new_text)
+            bg_item.setRect(text_item.boundingRect())
+
+    @QtCore.Slot()
+    def save_current(self):
+        if not self.current_project or self.current_project.status != "ready":
+            QtWidgets.QMessageBox.warning(self, "Wait", "Image not ready yet.")
+            return
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            ts = MangaTypesetter()
+            img_np = np.array(Image.open(self.current_project.path))
+            h, w, _ = img_np.shape
+            fmt_bubbles = []
+
+            def p2m(poly, w, h):
+                m = np.zeros((h, w), dtype=np.uint8)
+                pts = [[int(p.x()), int(p.y())] for p in poly]
+                if pts:
+                    cv2.fillPoly(m, np.array([pts], dtype=np.int32), 255)
+                return m
+
+            b: BubbleData
+            for b in self.current_project.bubbles:
+                mask = p2m(b.polygon, w, h)
+                fmt_bubbles.append({
+                    "translated_text": b.trans_text,
+                    "mask": mask,
+                    "original_mask": b.raw_mask,
+                })
+
+            final_np = ts.render(img_np, fmt_bubbles)
+            final_pil = Image.fromarray(final_np)
+
+            save_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save image", "", "PNG (*.png)"
             )
-            self.pending_pipeline_request = (img_path, model_name)
+            if save_path:
+                final_pil.save(save_path)
+                QtWidgets.QMessageBox.information(
+                    self, "Saved", f"Saved to  {save_path}"
+                )
 
-    def run_pipeline(self, img_path, model_name):
-        self.pipe_thread = QtCore.QThread()
-        self.pipe_worker = ProcessingPipeline(
-            img_path, model_name, self.ocr_model, self.translator_model
-        )
-        self.pipe_worker.moveToThread(self.pipe_thread)
-
-        self.pipe_thread.started.connect(self.pipe_worker.run)
-        self.pipe_worker.status_update.connect(self.progressPage.update_progress)
-        self.pipe_worker.finished.connect(self.on_pipeline_finished)
-        self.pipe_worker.error.connect(self.on_pipeline_error)
-
-        # Cleanup
-        self.pipe_worker.finished.connect(self.pipe_thread.quit)
-        self.pipe_worker.finished.connect(self.pipe_worker.deleteLater)
-        self.pipe_thread.finished.connect(self.pipe_thread.deleteLater)
-
-        self.pipe_thread.start()
-
-    def on_pipeline_finished(self, final_pil):
-        # Resize window for the result
-        self.resize(1000, 800)
-        self.stack.setCurrentWidget(self.resultPage)
-        self.resultPage.display_image(final_pil)
-
-    def on_pipeline_error(self, err):
-        QtWidgets.QMessageBox.critical(self, "Error", f"Processing Failed:\n{err}")
-        self.stack.setCurrentWidget(self.setupPage)
-
-    def reset_ui(self):
-        self.resize(500, 400)
-        self.stack.setCurrentWidget(self.setupPage)
-        self.setupPage.statusLabel.setText("Models Ready.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
 
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
-    window = MainWizard()
-    window.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
