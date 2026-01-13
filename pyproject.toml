@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "Lucile_bigshaq9999"
-version = "0.0.4"
+version = "0.0.5"
 authors = [{ name = "bigshaq9999", email = "" }]
 description = "A manga translate annotation app"
 readme = "README.md"
