@@ -13,15 +13,15 @@ classifiers = ["Programming Language :: Python :: 3", "Operating System :: OS In
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 dependencies = [
-  "accelerate",
-  "manga-ocr",
-  "numpy",
-  "opencv-python",
-  "pyside6",
-  "sacremoses",
-  "sentencepiece",
+  "accelerate==1.12.0",
+  "manga-ocr==0.1.14",
+  "numpy==2.2.6",
+  "opencv-python==4.12.0.88",
+  "pyside6==6.10.1",
+  "sacremoses==0.1.1",
+  "sentencepiece==0.2.1",
   "transformers==4.37.2",
-  "ultralytics",
+  "ultralytics==8.3.249",
 ]
 
 [tool.hatch.build.targets.wheel]
