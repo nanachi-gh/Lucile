@@ -17,7 +17,7 @@ class MangaTypesetter:
         Returns the final numpy image with text typeset.
         """
         image_final = original_image_rgb.copy()
-        erosion_kernel = np.ones((10, 10), np.uint8)
+        erosion_kernel = np.ones((6, 6), np.uint8)
 
         # 1. Whitening (Inpainting) Step
         for bubble in bubbles:
@@ -49,14 +49,20 @@ class MangaTypesetter:
 
         return np.array(pil_image)
 
-    def _smart_wrap_text(self, draw, text, font, max_width_px):
+    def _smart_wrap_text(self, draw, text, font, max_width_px, force_break=False):
         words = text.split()
         lines = []
         current_line = []
 
         for word in words:
-            test_line = " ".join(current_line + [word])
+            word_width = draw.textbbox((0, 0), word, font=font)[2]
+            if word_width > max_width_px:
+                if not force_break:
+                    return None
+
+            test_line = " ".join(current_line + [word]) if current_line else word
             w = draw.textbbox((0, 0), test_line, font=font)[2]
+
             if w <= max_width_px:
                 current_line.append(word)
             else:
@@ -73,9 +79,10 @@ class MangaTypesetter:
                         ):
                             temp_word += char
                         else:
-                            lines.append(temp_word)
+                            if temp_word:
+                                lines.append(temp_word)
                             temp_word = char
-                    current_line = [temp_word]
+                    current_line = [temp_word] if temp_word else []
         if current_line:
             lines.append(" ".join(current_line))
         return lines
@@ -102,29 +109,26 @@ class MangaTypesetter:
         mask_crop = mask[y : y + h, x : x + w]
 
         font_size = min(h, w)
-        min_font_size = 10
+        min_font_size = 12
         best_font = None
         best_lines = []
         best_y_start = 0
 
         while font_size >= min_font_size:
             font = ImageFont.truetype(self.font_path, font_size)
-            lines = self._smart_wrap_text(draw, text, font, w * 0.9)
+            lines = self._smart_wrap_text(draw, text, font, w * 0.95, force_break=False)
 
-            text_h = sum([draw.textbbox((0, 0), line, font=font)[3] for line in lines])
-            text_w = (
-                max([draw.textbbox((0, 0), line, font=font)[2] for line in lines])
-                if lines
-                else 0
-            )
-
-            if text_h > h or text_w > w:
+            if lines is None:
                 font_size -= 2
                 continue
 
-            # Pixel Perfect Check
-            text_canvas = np.zeros((h, w), dtype=np.uint8)
-            pil_canvas = Image.fromarray(text_canvas)
+            text_h = sum([draw.textbbox((0, 0), line, font=font)[3] for line in lines])
+
+            if text_h > h:
+                font_size -= 2
+                continue
+
+            pil_canvas = Image.new("L", (w, h), 0)
             canvas_draw = ImageDraw.Draw(pil_canvas)
 
             curr_y = (cy - y) - (text_h / 2)
@@ -138,6 +142,7 @@ class MangaTypesetter:
                 )
                 curr_y += line_h
 
+            # Check collision (Text pixels vs Mask Wall pixels)
             if not self._check_mask_collision(np.array(pil_canvas), mask_crop):
                 best_font = font
                 best_lines = lines
@@ -146,16 +151,27 @@ class MangaTypesetter:
 
             font_size -= 2
 
+        if best_font is None:
+            print(
+                f"Warning: Text could not fit perfectly in bubble. Forcing render. Text: {text[:20]}..."
+            )
+            best_font = ImageFont.truetype(self.font_path, min_font_size)
+            best_lines = self._smart_wrap_text(
+                draw, text, best_font, w, force_break=True
+            )
+
+            # Recalculate height
+            text_h = sum([
+                draw.textbbox((0, 0), line, font=best_font)[3] for line in best_lines
+            ])
+            best_y_start = cy - (text_h / 2)
+
         # Draw to main image
-        if best_font:
-            current_y = best_y_start
-            for line in best_lines:
-                line_w = draw.textbbox((0, 0), line, font=best_font)[2]
-                line_h = draw.textbbox((0, 0), line, font=best_font)[3]
-                draw.text(
-                    (cx - line_w / 2, current_y),
-                    line,
-                    font=best_font,
-                    fill=self.text_color,
-                )
-                current_y += line_h
+        current_y = best_y_start
+        for line in best_lines:
+            line_w = draw.textbbox((0, 0), line, font=best_font)[2]
+            line_h = draw.textbbox((0, 0), line, font=best_font)[3]
+            draw.text(
+                (cx - line_w / 2, current_y), line, font=best_font, fill=self.text_color
+            )
+            current_y += line_h
