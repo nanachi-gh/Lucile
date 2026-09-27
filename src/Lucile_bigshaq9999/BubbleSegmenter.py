@@ -1,13 +1,22 @@
 # code/pipeline/Utils/BubbleSegmenter.py
 import cv2
+import logging
 import numpy as np
 import sys
+import torch
 from ultralytics import YOLO
+
+logger = logging.getLogger(__name__)
 
 
 class BubbleSegmenter:
-    def __init__(self, yolo_model_path):
+    def __init__(self, yolo_model_path, device="auto"):
         self.yolo_model = YOLO(yolo_model_path)
+        if device == "auto" or device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
         # Hyperparameters for splitting
         self.MIN_DEFECT_DEPTH = 13
         self.MAX_ANGLE_DEG = 170
@@ -20,8 +29,22 @@ class BubbleSegmenter:
         Main entry point: Detects raw masks and refines them via splitting.
         Returns a list of dictionaries with 'mask', 'bbox', 'contour'.
         """
-        # 1. Run YOLO
-        results = self.yolo_model.predict(source=image_path, verbose=False)
+        # 1. Run YOLO with GPU support and fallback
+        try:
+            results = self.yolo_model.predict(
+                source=image_path, device=self.device, verbose=False
+            )
+        except Exception as e:
+            if self.device != "cpu":
+                logger.warning(
+                    f"YOLO segmentation failed on {self.device}: {e}. Falling back to CPU."
+                )
+                self.device = "cpu"
+                results = self.yolo_model.predict(
+                    source=image_path, device="cpu", verbose=False
+                )
+            else:
+                raise e
         result = results[0]
 
         image_rgb = cv2.cvtColor(result.orig_img, cv2.COLOR_BGR2RGB)
@@ -78,34 +101,33 @@ class BubbleSegmenter:
             if hull_indices is None or len(hull_indices) < 3:
                 return [bubble_mask]
             defects = cv2.convexityDefects(contour, hull_indices)
-        except:
+            if defects is None:
+                return [bubble_mask]
+
+            candidates = []
+            defects = defects.reshape(-1, 4)
+            for s, e, f, d in defects:
+                depth = d / 256.0
+
+                if depth > self.MIN_DEFECT_DEPTH:
+                    far = tuple(contour[f][0])
+                    start = tuple(contour[s][0])
+                    end = tuple(contour[e][0])
+
+                    v1 = np.array(start) - np.array(far)
+                    v2 = np.array(end) - np.array(far)
+                    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+
+                    if n1 == 0 or n2 == 0:
+                        continue
+
+                    cosine = np.dot(v1, v2) / (n1 * n2)
+                    angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+                    if angle < self.MAX_ANGLE_DEG:
+                        candidates.append({"point": far, "depth": depth})
+        except Exception:
             return [bubble_mask]
-
-        if defects is None:
-            return [bubble_mask]
-
-        candidates = []
-        for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
-            depth = d / 256.0
-
-            if depth > self.MIN_DEFECT_DEPTH:
-                far = tuple(contour[f][0])
-                start = tuple(contour[s][0])
-                end = tuple(contour[e][0])
-
-                v1 = np.array(start) - np.array(far)
-                v2 = np.array(end) - np.array(far)
-                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-
-                if n1 == 0 or n2 == 0:
-                    continue
-
-                cosine = np.dot(v1, v2) / (n1 * n2)
-                angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
-
-                if angle < self.MAX_ANGLE_DEG:
-                    candidates.append({"point": far, "depth": depth})
 
         # Clustering
         candidates.sort(key=lambda x: x["depth"], reverse=True)

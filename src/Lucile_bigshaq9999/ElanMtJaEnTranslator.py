@@ -1,41 +1,62 @@
 from transformers import pipeline
 from typing import List
 import gc
+import logging
+import torch
+
+logger = logging.getLogger(__name__)
 
 
 class ElanMtJaEnTranslator:
     def __init__(self):
         self.model = None
+        self.device = "cpu"
+        self.elan_model = "tiny"
+        self.model_id = "Mitsua/elan-mt-tiny-ja-en"
 
     def load_model(self, device="auto", elan_model="tiny"):
-        if self.model is None:
-            if elan_model == "bt":
-                self.model = pipeline(
-                    "translation_ja_to_en",
-                    model="Mitsua/elan-mt-bt-ja-en",
-                    framework="pt",
-                    device_map=device,
+        if device == "auto" or device is None:
+            target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            target_device = device
+
+        self.elan_model = elan_model
+
+        model_map = {
+            "bt": "Mitsua/elan-mt-bt-ja-en",
+            "base": "Mitsua/elan-mt-base-ja-en",
+            "tiny": "Mitsua/elan-mt-tiny-ja-en",
+        }
+        if elan_model not in model_map:
+            raise ValueError(
+                f"Invalid elan model: {elan_model}, please choose from 'bt', 'base', 'tiny'"
+            )
+
+        self.model_id = model_map[elan_model]
+        logger.info(f"Loading translation pipeline {self.model_id} on {target_device}")
+
+        try:
+            self.model = pipeline(
+                "translation_ja_to_en",
+                model=self.model_id,
+                framework="pt",
+                device=target_device,
+            )
+            self.device = target_device
+        except Exception as e:
+            if target_device != "cpu":
+                logger.warning(
+                    f"Failed to load translation pipeline on {target_device}: {e}. Falling back to CPU."
                 )
-            elif elan_model == "base":
+                self.device = "cpu"
                 self.model = pipeline(
                     "translation_ja_to_en",
-                    model="Mitsua/elan-mt-base-ja-en",
+                    model=self.model_id,
                     framework="pt",
-                    device_map=device,
-                )
-            elif elan_model == "tiny":
-                self.model = pipeline(
-                    "translation_ja_to_en",
-                    model="Mitsua/elan-mt-tiny-ja-en",
-                    framework="pt",
-                    device_map=device,
+                    device="cpu",
                 )
             else:
-                raise ValueError(
-                    f"Invalid elan model: {elan_model}, please choose from 'bt', 'base', 'tiny'"
-                )
-        else:
-            print("Model is already loaded")
+                raise e
 
     def predict(self, source_texts: List[str]) -> List[str]:
         """
@@ -47,15 +68,40 @@ class ElanMtJaEnTranslator:
         if isinstance(source_texts, str):
             source_texts = [source_texts]
 
-        translated_texts = []
-        for text in source_texts:
-            translation = self.model(text)
-            translated_texts.append(translation[0]["translation_text"])
+        if not source_texts:
+            return []
 
-        return translated_texts
+        try:
+            results = self.model(source_texts)
+            return [res["translation_text"] for res in results]
+        except Exception as e:
+            if self.device != "cpu":
+                logger.warning(
+                    f"Translation failed on {self.device}: {e}. Falling back to CPU."
+                )
+                try:
+                    self.device = "cpu"
+                    self.model = pipeline(
+                        "translation_ja_to_en",
+                        model=self.model_id,
+                        framework="pt",
+                        device="cpu",
+                    )
+                    results = self.model(source_texts)
+                    return [res["translation_text"] for res in results]
+                except Exception as cpu_e:
+                    logger.error(f"CPU fallback translation failed: {cpu_e}")
+                    return ["" for _ in source_texts]
+            else:
+                logger.error(f"Translation failed: {e}")
+                return ["" for _ in source_texts]
 
     def unload_model(self):
         del self.model
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.model = None
+        self.device = "cpu"
         print("Model unloaded")
+
